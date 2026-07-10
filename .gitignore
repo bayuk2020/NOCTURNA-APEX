@@ -1,0 +1,14 @@
+# Regenerable market data — ticks.parquet (~231MB) exceeds GitHub's 100MB limit.
+# Rebuild locally on Windows+MT5 via: python -m nocturna.data.mt5_downloader
+market_data/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local Claude Code settings (personal, per-machine)
+.claude/settings.local.json
+
+# Stray smoke-test screenshots written to the repo root
+apex_smoke*.png
