@@ -24,23 +24,50 @@ import finplot as fplt
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QKeySequence, QShortcut
-from PyQt6.QtWidgets import QHBoxLayout, QMainWindow, QScrollArea, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QMainWindow, QScrollArea, QVBoxLayout, QWidget
 
 from .replay import TickDataset
 from .engine.simulator import Account, Side
 from .apex_panel import DashboardPanel
 from .dashboard import nocturna_apex_snapshot, check_risk_triggers
 from .strategy_replay import StrategyReplay, _demo_strategy
+from .indicators.base import IndicatorRegistry
+from .indicators.library import register_builtins
 
 # risk actions that must FORCE a real close_all (not just show a ✘ badge)
 _FORCE_CLOSE_ACTIONS = ("CLOSE_ALL_DAILY_STOP", "CLOSE_ALL_EQUITY_PROTECTOR")
 
 _TZ_SHIFT_H = {"SERVER": 0, "UTC": -3, "WIB": 4}
 
+# indicator plot keys that are regime/signal flags (0/1 or ±1), NOT price lines —
+# never drawn on an axis (e.g. Supertrend 'direction', UTBot 'buy'/'sell').
+_SKIP_PLOT_KEYS = {"direction", "buy", "sell"}
+# subwindow horizontal guide levels per indicator type
+_GUIDE_LEVELS = {"RSI": (70, 50, 30)}
+
+
+def default_indicator_registry() -> IndicatorRegistry:
+    """Code-defined active indicators for work-order #2 (no add/edit UI yet, that
+    is work-order #5): EMA(9) green + EMA(21) blue overlay, RSI(14) subwindow."""
+    reg = IndicatorRegistry()
+    register_builtins(reg)
+    reg.create("EMA", params={"length": 9}, colors={"ema": "#26c281"})
+    reg.create("EMA", params={"length": 21}, colors={"ema": "#3b82f6"})
+    reg.create("RSI", params={"length": 14})
+    return reg
+
+
+def _legend_for(inst) -> str:
+    for k in ("length", "period", "atr_period"):
+        if k in inst.params:
+            return f"{inst.name} {inst.params[k]}"
+    return inst.name
+
 
 class NocturnaApexWindow(QMainWindow):
     def __init__(self, sr: StrategyReplay, symbol: str, display_tf: str,
-                 display_tz: str, risk_cfg: dict, interval: float = 0.05):
+                 display_tz: str, risk_cfg: dict, interval: float = 0.05,
+                 indicators: IndicatorRegistry | None = None):
         super().__init__()
         self.sr = sr
         self.symbol = symbol
@@ -58,18 +85,37 @@ class NocturnaApexWindow(QMainWindow):
         self.setWindowTitle(f"NOCTURNA-APEX v2 — {symbol} {display_tf} ({display_tz})")
         self.setStyleSheet("QMainWindow { background:#0a0e17; }")
 
+        # ---- indicators (code-defined; work-order #2) ----
+        self.indicators = indicators if indicators is not None else default_indicator_registry()
+        insts = self.indicators.instances(only_enabled=True)
+        self._overlay_insts = [i for i in insts if i.overlay]
+        self._sub_insts = [i for i in insts if not i.overlay]
+
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ---- left: finplot chart embedded ----
-        self.ax = fplt.create_plot_widget(master=self, rows=1, init_zoom_periods=150)
-        self.axs = [self.ax]                       # finplot refresh() reads win.axs
-        chart_widget = self.ax.ax_widget
-        chart_widget.setMinimumWidth(700)
-        layout.addWidget(chart_widget, stretch=1)
+        # ---- left: finplot price chart + one subwindow per non-overlay indicator ----
+        # rows>1 gives finplot an X-linked PlotWidget per row; win.axs MUST list them
+        # all or refresh()/autoscale errors (see HANDOFF embed notes).
+        rows = 1 + len(self._sub_insts)
+        axs = fplt.create_plot_widget(master=self, rows=rows, init_zoom_periods=150)
+        axs = list(axs) if isinstance(axs, (list, tuple)) else [axs]
+        self.axs = axs                             # finplot refresh() reads win.axs
+        self.ax = axs[0]                           # price axis (candles + overlays)
+        self._sub_axes = axs[1:]                   # one axis per subwindow indicator
+
+        chart_col = QWidget()
+        chart_v = QVBoxLayout(chart_col)
+        chart_v.setContentsMargins(0, 0, 0, 0)
+        chart_v.setSpacing(0)
+        chart_v.addWidget(self.ax.ax_widget, stretch=4)
+        for sax in self._sub_axes:
+            chart_v.addWidget(sax.ax_widget, stretch=1)
+        chart_col.setMinimumWidth(700)
+        layout.addWidget(chart_col, stretch=1)
 
         # ---- right: dashboard panel (scrollable so it survives short screens) ----
         self.panel = DashboardPanel(config=risk_cfg,
@@ -87,6 +133,8 @@ class NocturnaApexWindow(QMainWindow):
         cols = ["open", "close", "high", "low"]
         self.candles = fplt.candlestick_ochl(sr.df[cols], ax=self.ax)
         self._marker_handles = {"buy": None, "sell": None, "exit": None}
+        self._ind_handles = {}                     # (instance_id, plot_key) -> handle
+        self._build_indicator_plots()
 
         # ---- wire manual trade buttons (TAHAP B sub-langkah 1) ----
         self.panel.btn_buy.clicked.connect(self._on_buy)
@@ -124,6 +172,7 @@ class NocturnaApexWindow(QMainWindow):
             return
         self._maybe_daily_reset(self.sr.cur_time)
         self.candles.update_data(self.sr.df[["open", "close", "high", "low"]])
+        self._update_indicators()
         self._draw_markers(fr)
         snap = self._push_snapshot()
         self._apply_risk_triggers(snap)
@@ -160,6 +209,53 @@ class NocturnaApexWindow(QMainWindow):
                     aligned, ax=self.ax, color=color, style=style, width=2, legend=name)
             else:
                 self._marker_handles[name].update_data(aligned)
+
+    # --------------------------------------------------------- indicators
+    def _indicator_series(self):
+        """Compute all enabled indicators on the CURRENT display bars. The bars
+        df is already display-tz indexed, so the returned series share the candle
+        index — lines align exactly and are never shifted twice (jebakan b)."""
+        return self.indicators.compute_all(self.sr.df, only_enabled=True)
+
+    def _build_indicator_plots(self):
+        out = self._indicator_series()
+        for inst in self._overlay_insts:
+            self._plot_instance(inst, self.ax, out.get(inst.instance_id, {}))
+        for inst, sax in zip(self._sub_insts, self._sub_axes):
+            self._plot_instance(inst, sax, out.get(inst.instance_id, {}))
+            for lvl in _GUIDE_LEVELS.get(inst.name, ()):
+                sax.addItem(pg.InfiniteLine(
+                    pos=lvl, angle=0,
+                    pen=pg.mkPen("#39415a", style=Qt.PenStyle.DashLine)))
+
+    def _plot_instance(self, inst, ax, comp):
+        first = True
+        for p in inst.plots:
+            if p.key in _SKIP_PLOT_KEYS:
+                continue
+            series = comp.get(p.key)
+            if series is None:
+                continue
+            s = series.dropna()                    # jebakan a: drop warmup NaN
+            if len(s) == 0:
+                continue
+            color = inst.colors.get(p.key, p.color)
+            h = fplt.plot(s, ax=ax, color=color, width=max(p.width, 2),
+                          legend=_legend_for(inst) if first else None)
+            self._ind_handles[(inst.instance_id, p.key)] = h
+            first = False
+
+    def _update_indicators(self):
+        if not self._ind_handles:
+            return
+        out = self._indicator_series()
+        for (iid, key), h in self._ind_handles.items():
+            comp = out.get(iid)
+            if not comp or key not in comp:
+                continue
+            s = comp[key].dropna()
+            if len(s):
+                h.update_data(s)
 
     def _push_snapshot(self):
         cfg = self.risk_cfg
@@ -286,6 +382,7 @@ def run_apex(parquet_dir="market_data", symbol="XAUUSD",
              balance=10_000, leverage=1000, spread=0.18, commission_per_lot=0.0,
              daily_target_pct=20.0, daily_stop_pct=3.0, equity_protector_pct=15.0,
              basket_target_pct=5.0, news_filter=False, max_layers=5,
+             indicators=None,
              smoke=False, smoke_mode="manual", smoke_seconds=8.0,
              screenshot_path=None, shots_dir=None):
     app = pg.mkQApp()
@@ -309,7 +406,8 @@ def run_apex(parquet_dir="market_data", symbol="XAUUSD",
     if smoke and smoke_mode == "risk":
         _seed_demo_basket(sr)     # a losing basket that must auto-close on breach
 
-    win = NocturnaApexWindow(sr, symbol, display_tf, display_tz, risk_cfg, interval)
+    win = NocturnaApexWindow(sr, symbol, display_tf, display_tz, risk_cfg, interval,
+                             indicators=indicators)
     win.resize(1500, 950)
     win.show()
     fplt.show(qt_exec=False)     # finplot refresh() within our own event loop
@@ -398,6 +496,33 @@ def run_apex(parquet_dir="market_data", symbol="XAUUSD",
                            (2900, p_shot_b), (3000, p_resume), (4200, p_done)]:
                 QTimer.singleShot(ms, fn)
 
+        elif smoke_mode == "indicators":
+            def ind_tips():
+                out = win._indicator_series()
+                bits = []
+                for inst in win._overlay_insts + win._sub_insts:
+                    comp = out.get(inst.instance_id, {})
+                    for p in inst.plots:
+                        if p.key in _SKIP_PLOT_KEYS:
+                            continue
+                        s = comp.get(p.key)
+                        if s is not None and s.dropna().size:
+                            bits.append(f"{_legend_for(inst)}={s.dropna().iloc[-1]:.2f}")
+                            break
+                return " ".join(bits)
+
+            def ind_a():
+                print(f"[apex] indicators@A cur_time={sr.cur_time} | {ind_tips()}")
+                shot("wo2_01_indicators_a.png", "EMA9/EMA21 overlay + RSI subwindow")
+
+            def ind_b():
+                print(f"[apex] indicators@B cur_time={sr.cur_time} | {ind_tips()}")
+                shot("wo2_02_indicators_b.png", "replay advanced -> indicator lines moved")
+                app.quit()
+
+            QTimer.singleShot(1500, ind_a)
+            QTimer.singleShot(int(smoke_seconds * 1000), ind_b)
+
     app.exec()
 
 
@@ -405,6 +530,8 @@ if __name__ == "__main__":
     kwargs = {}
     if "--smoke" in sys.argv:
         kwargs["smoke"] = True
-    if "--risk" in sys.argv:
-        kwargs.update(smoke=True, smoke_mode="risk")
+    for mode in ("risk", "pause", "indicators", "manual"):
+        if f"--{mode}" in sys.argv:
+            kwargs.update(smoke=True, smoke_mode=mode)
+            break
     run_apex(**kwargs)

@@ -32,7 +32,8 @@ MT5 -> data/mt5_downloader.py -> Parquet
          chart_replay_fp.py: replay chart bergerak (finplot, SPACE pause, Up/Down speed)
          dashboard.py: nocturna_apex_snapshot (4 panel) + check_risk_triggers + ADX
          apex_panel.py: DashboardPanel PyQt6 (view read-only 4 seksi, update_snapshot)
-         apex_app.py: NocturnaApexWindow (finplot embed + panel + drive replay) [TAHAP A]
+         apex_app.py: NocturnaApexWindow (finplot embed + panel + manual trade + risk halt
+                      + pause + indikator overlay/subwindow live) [TAHAP A + B + WO#2]
 ```
 
 ## Cara embed finplot ke PyQt6 (dipakai apex_app.py — penting untuk TAHAP B/C)
@@ -96,6 +97,21 @@ supaya satu proses & mudah debug; finplot sudah berbasis PyQt6 jadi bisa disemat
   * Terverifikasi: test_pause.py (ALL PASS) — freeze (cur_time & panel beku), resume mulus,
     label toggle, pause bisa saat halted & halt tak lepas, SPACE (QTest.keyClick) toggle.
     Plus smoke visual `smoke_mode='pause'`: cur_time 04:06:33 beku 1.2s lalu lanjut 04:14:15.
+- WORK-ORDER #2 SELESAI & TERUJI (2026-07-10) — indikator TAMPIL di chart:
+  * apex_app.py menggambar output IndicatorRegistry ke chart, update tiap frame.
+    Overlay (.overlay==True) di axis harga; tiap indikator subwindow (.overlay==False)
+    dapat 1 axis sendiri via create_plot_widget(rows=1+N). win.axs mencakup SEMUA axis
+    (jebakan c). Dihitung dari sr.df (sudah display-tz -> index sama dgn candle, tak
+    ter-shift dua kali, jebakan b). dropna() sebelum plot (jebakan a). update_data() live.
+  * Skip key non-harga: Supertrend 'direction', UTBot 'buy'/'sell' (_SKIP_PLOT_KEYS).
+    RSI subwindow dikasih guide 30/50/70 (InfiniteLine).
+  * Indikator aktif via KODE: default_indicator_registry() = EMA9 hijau + EMA21 biru +
+    RSI14. Bisa override lewat run_apex(indicators=<IndicatorRegistry>). BELUM ada UI
+    add/edit/hapus (itu work-order #5, ditunda).
+  * Terverifikasi smoke `smoke_mode='indicators'`: EMA overlay + RSI subwindow gerak live
+    (EMA9 4002.94->4000.24, RSI 29.00->21.97). Stress test 7 indikator (EMA/BB/Supertrend/
+    UTBot overlay + RSI/MACD/ATR subwindow) render tanpa crash. test_pause & test_halt
+    tetap ALL PASS (tak ada regresi dari perubahan layout multi-axis).
 - TAHAP C: Martingale/grid/trailing/multiple-position + tabel history transaksi.
 - TAHAP D: Equity curve, drawdown chart, pie win/loss (polesan).
 
@@ -105,10 +121,10 @@ berat tapi tidak memblokir pengujian. Kerjakan SATU nomor per tugas, verifikasi,
 baru lanjut (jangan tumpuk beberapa nomor sekaligus — sumber bug GUI bercampur).
 
   1. Pause EA + hotkey SPACE                    <- SELESAI (2026-07-10)
-  2. Indikator TAMPIL di chart (EMA/UTBot overlay, RSI/MACD subwindow).  <- BERIKUTNYA
+  2. Indikator TAMPIL di chart (EMA/UTBot overlay, RSI/MACD subwindow).  <- SELESAI (2026-07-10)
      Engine indikator sudah ada; ini murni menggambar ke chart finplot + update live.
   3. Pending order di UI (Buy/Sell Stop, Buy/Sell Limit) — simulator perlu matching
-     pending vs bar high/low (match_pending sudah ada di engine/backtest.py).
+     pending vs bar high/low (match_pending sudah ada di engine/backtest.py).  <- BERIKUTNYA
   4. Martingale/grid otomatis + TABEL HISTORY transaksi (basket multi-layer + log).
   5. Manajemen indikator dari UI (add/edit/hapus/warna/multi-instance, ala TradingView)
      <- SENGAJA DITUNDA: paling kompleks (dialog+list+colorpicker), TIDAK memblokir
