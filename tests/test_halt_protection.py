@@ -96,4 +96,6 @@ check("strategy reopened after new day", bool(acc.positions))
 print(f"      open={len(acc.positions)} closed={len(acc.history)}")
 
 print("\n=== RESULT:", "ALL PASS" if PASS else "SOME FAILED", "===")
-raise SystemExit(0 if PASS else 1)
+# os._exit avoids an intermittent Qt/finplot teardown segfault on this stack.
+sys.stdout.flush()
+os._exit(0 if PASS else 1)

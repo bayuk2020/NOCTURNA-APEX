@@ -117,4 +117,6 @@ QApplication.processEvents()
 check("SPACE flipped pause back", win._paused == before)
 
 print("\n=== RESULT:", "ALL PASS" if PASS else "SOME FAILED", "===")
-raise SystemExit(0 if PASS else 1)
+# os._exit avoids an intermittent Qt/finplot teardown segfault on this stack.
+sys.stdout.flush()
+os._exit(0 if PASS else 1)

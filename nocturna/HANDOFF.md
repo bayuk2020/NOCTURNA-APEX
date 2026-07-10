@@ -102,7 +102,9 @@ supaya satu proses & mudah debug; finplot sudah berbasis PyQt6 jadi bisa disemat
     Overlay (.overlay==True) di axis harga; tiap indikator subwindow (.overlay==False)
     dapat 1 axis sendiri via create_plot_widget(rows=1+N). win.axs mencakup SEMUA axis
     (jebakan c). Dihitung dari sr.df (sudah display-tz -> index sama dgn candle, tak
-    ter-shift dua kali, jebakan b). dropna() sebelum plot (jebakan a). update_data() live.
+    ter-shift dua kali, jebakan b). Series indikator dikirim FULL-LENGTH (index sama
+    dgn candle, warmup NaN = gap garis) — JANGAN dropna: di finplot x_indexed, series
+    lebih pendek MISALIGN + bikin auto-scroll ke ujung series pendek. update_data() live.
   * Skip key non-harga: Supertrend 'direction', UTBot 'buy'/'sell' (_SKIP_PLOT_KEYS).
     RSI subwindow dikasih guide 30/50/70 (InfiniteLine).
   * Indikator aktif via KODE: default_indicator_registry() = EMA9 hijau + EMA21 biru +
@@ -112,6 +114,22 @@ supaya satu proses & mudah debug; finplot sudah berbasis PyQt6 jadi bisa disemat
     (EMA9 4002.94->4000.24, RSI 29.00->21.97). Stress test 7 indikator (EMA/BB/Supertrend/
     UTBot overlay + RSI/MACD/ATR subwindow) render tanpa crash. test_pause & test_halt
     tetap ALL PASS (tak ada regresi dari perubahan layout multi-axis).
+- FIX PERFORMA + ZOOM SELESAI & TERUJI (2026-07-11) — 2 masalah setelah WO#2:
+  * Masalah 1 (loop tersumbat): _update_indicators() (satu recompute penuh ~40ms)
+    dulu jalan TIAP frame -> event loop macet (candle telat, klik telat, pause/marker
+    lelet). Sekarang di-THROTTLE: indikator recompute+redraw HANYA saat bar baru
+    (_ind_bar_len berubah), marker redraw HANYA saat entry/exit baru (_marker_sig).
+    Warning "All-NaN slice" (dari ScatterPlotItem marker NaN-padded saat marker di luar
+    view) DIBUNGKAM via warnings.filterwarnings di apex_app (NaN-pad wajib utk alignment
+    x_indexed, jadi tak bisa di-skip). Terverifikasi tests/test_perf.py: recompute 8x /
+    200 frame, avg_tick 29ms < 40ms, 0 warning, klik BUY -> marker langsung.
+  * Masalah 2 (zoom out keseret balik): _tick() simpan view sebelum update; auto-scroll
+    DIBIARKAN hanya kalau view masih nempel ujung kanan (_is_following: x1 >= last_bar-3;
+    x = bar-index krn finplot x_indexed). Kalau user zoom out/geser kiri -> restore view
+    (setRange) biar tak keseret; balik ke ujung kanan -> auto-scroll lanjut. Skip restore
+    saat drag aktif (vb.win._isMouseLeftDrag). Terverifikasi tests/test_zoom.py.
+  * CATATAN: stack finplot/PyQt6/Py3.14 kadang segfault (0xC0000005) SAAT TEARDOWN — tak
+    fatal (kerjaan/test sudah selesai). Semua test pakai os._exit() utk hindari itu.
 - TAHAP C: Martingale/grid/trailing/multiple-position + tabel history transaksi.
 - TAHAP D: Equity curve, drawdown chart, pie win/loss (polesan).
 
@@ -155,6 +173,8 @@ python -m nocturna.demo_run                 # smoke test core (data sintetis)
 ```
 
 ## Sisa bug kecil (tidak fatal)
-- Warning "All-NaN slice" dari pyqtgraph ScatterPlotItem saat marker sedikit —
-  candle & marker tetap tampil. Bisa dibungkam nanti.
+- Warning "All-NaN slice" (ScatterPlotItem marker) — SUDAH DIBUNGKAM di apex_app
+  (warnings.filterwarnings, 2026-07-11). Lihat FIX PERFORMA + ZOOM di atas.
 - DPI warning Windows ("SetProcessDpiAwarenessContext failed") — abaikan.
+- Segfault 0xC0000005 sesekali saat teardown proses GUI/test — tak fatal (hasil sudah
+  jadi). Test pakai os._exit(). Kalau smoke crash di akhir, cek screenshot tetap tersimpan.

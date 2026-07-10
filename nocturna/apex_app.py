@@ -17,8 +17,17 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 
 import pandas as pd
+
+# Markers are drawn as a NaN-padded series aligned to the candle bar-index
+# (finplot x_indexed mode REQUIRES this for correct x-alignment). On every
+# autorange finplot asks pyqtgraph for the ScatterPlotItem bounds over the
+# *visible* slice; when no marker is currently in view that slice is all-NaN and
+# numpy floods a harmless "All-NaN slice" RuntimeWarning. Silence just that one.
+warnings.filterwarnings("ignore", message="All-NaN slice encountered",
+                        category=RuntimeWarning)
 
 import finplot as fplt
 import pyqtgraph as pg
@@ -135,6 +144,13 @@ class NocturnaApexWindow(QMainWindow):
         self._marker_handles = {"buy": None, "sell": None, "exit": None}
         self._ind_handles = {}                     # (instance_id, plot_key) -> handle
         self._build_indicator_plots()
+        # throttle state: indicators recompute only on a NEW closed bar, markers
+        # redraw only when an entry/exit is added — NOT every tick-frame (that
+        # full recompute+redraw per frame was clogging the Qt event loop, WO#2).
+        self._ind_bar_len = len(sr.df)
+        self._marker_sig = (0, 0, 0)
+        self._follow_margin = 3        # bars: how close to the last bar counts as
+                                       # "following the right edge" (auto-scroll on)
 
         # ---- wire manual trade buttons (TAHAP B sub-langkah 1) ----
         self.panel.btn_buy.clicked.connect(self._on_buy)
@@ -171,11 +187,55 @@ class NocturnaApexWindow(QMainWindow):
             self._timer.stop()
             return
         self._maybe_daily_reset(self.sr.cur_time)
+
+        # capture the user's view BEFORE any update_data (each of which makes
+        # finplot try to auto-scroll). We only let it auto-scroll when the view is
+        # still stuck to the right edge; if the user zoomed out / panned away we
+        # restore their view so the next frame doesn't drag them back (Masalah 2).
+        vb = self.ax.vb
+        view = self._capture_view(vb)
+        following = self._is_following(view)
+
         self.candles.update_data(self.sr.df[["open", "close", "high", "low"]])
-        self._update_indicators()
-        self._draw_markers(fr)
+        # indicators: recompute + redraw only when a NEW bar has formed, not every
+        # tick-frame (restores pre-indicator responsiveness).
+        n_bars = len(self.sr.df)
+        if n_bars != self._ind_bar_len:
+            self._ind_bar_len = n_bars
+            self._update_indicators()
+        # markers: redraw only when an entry/exit was actually added.
+        sig = (len(self.sr.buys), len(self.sr.sells), len(self.sr.exits))
+        if sig != self._marker_sig:
+            self._marker_sig = sig
+            self._draw_markers(fr)
+
+        if view is not None and not following and not self._is_dragging():
+            vb.setRange(xRange=(view[0], view[1]), yRange=(view[2], view[3]),
+                        padding=0)
+
         snap = self._push_snapshot()
         self._apply_risk_triggers(snap)
+
+    def _capture_view(self, vb):
+        try:
+            (x0, x1), (y0, y1) = vb.viewRange()
+            return (x0, x1, y0, y1)
+        except Exception:
+            return None
+
+    def _is_following(self, view):
+        """True when the view's right edge sits at (or within a few bars of) the
+        latest bar. finplot uses bar-index x (x_indexed), so this is a simple
+        index comparison. Zoomed-out/panned-left -> right edge falls behind -> not
+        following -> we freeze the user's view instead of auto-scrolling."""
+        if view is None:
+            return True
+        return view[1] >= (len(self.sr.df) - 1) - self._follow_margin
+
+    def _is_dragging(self):
+        # finplot sets this on the master while the left mouse button pans; never
+        # fight an active drag.
+        return bool(getattr(self.ax.vb.win, "_isMouseLeftDrag", False))
 
     def _apply_risk_triggers(self, snap):
         """Turn check_risk_triggers() into a REAL close_all — otherwise the ✘
@@ -234,13 +294,14 @@ class NocturnaApexWindow(QMainWindow):
             if p.key in _SKIP_PLOT_KEYS:
                 continue
             series = comp.get(p.key)
-            if series is None:
-                continue
-            s = series.dropna()                    # jebakan a: drop warmup NaN
-            if len(s) == 0:
-                continue
+            if series is None or series.notna().sum() == 0:
+                continue                            # nothing computed yet (all NaN)
             color = inst.colors.get(p.key, p.color)
-            h = fplt.plot(s, ax=ax, color=color, width=max(p.width, 2),
+            # pass the FULL candle-length series: warmup NaN just leaves a line gap.
+            # dropna would shorten it -> in finplot x_indexed mode that both
+            # MISALIGNS the line and makes finplot auto-scroll to the shorter
+            # series' right edge (dragging the view). Keep it candle-aligned.
+            h = fplt.plot(series, ax=ax, color=color, width=max(p.width, 2),
                           legend=_legend_for(inst) if first else None)
             self._ind_handles[(inst.instance_id, p.key)] = h
             first = False
@@ -253,8 +314,8 @@ class NocturnaApexWindow(QMainWindow):
             comp = out.get(iid)
             if not comp or key not in comp:
                 continue
-            s = comp[key].dropna()
-            if len(s):
+            s = comp[key]
+            if s is not None and s.notna().sum() > 0:  # full-length, candle-aligned
                 h.update_data(s)
 
     def _push_snapshot(self):
